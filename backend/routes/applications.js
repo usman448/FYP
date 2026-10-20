@@ -1,0 +1,425 @@
+const express = require("express");
+const multer = require("multer");
+const pool = require("../config/db");
+const admin = require("../config/firebase");
+const requireAuth = require("../middleware/auth");
+const logAudit = require("../utils/auditLog");
+
+const router = express.Router();
+// APKs are held in memory only long enough to write them into the
+// app_packages.apk_data column — never written to local disk (Render's
+// filesystem is ephemeral, so on-disk storage wouldn't survive a
+// redeploy anyway). 150MB covers real-world APK sizes with headroom.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
+
+function isValidPackage(pkg) {
+  return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/.test(pkg);
+}
+
+// POST /api/applications   (SRS-012 FR-01/02)
+router.post("/", requireAuth, async (req, res) => {
+  try {
+    const { name, package_name, version, category, install_type, organization_id } = req.body;
+    const orgId = req.user.is_super_admin ? (organization_id || req.user.organization_id) : req.user.organization_id;
+
+    if (!name || !name.trim()) return res.status(400).json({ error: "Application name is required" });
+    if (!package_name || !isValidPackage(package_name)) return res.status(400).json({ error: "Package name is invalid" });
+
+    const dup = await pool.query("SELECT id FROM applications WHERE organization_id = $1 AND package_name = $2", [orgId, package_name]);
+    if (dup.rows.length > 0) return res.status(409).json({ error: "Package already exists" });
+
+    const result = await pool.query(
+      `INSERT INTO applications (organization_id, name, package_name, version, category, install_type)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [orgId, name.trim(), package_name, version || null, category || "Public", install_type || "Optional"]
+    );
+
+    await logAudit({ userId: req.user.id, organizationId: orgId, action: "application_registered", status: "success", req, details: package_name });
+    res.status(201).json({ message: "Application registered", application: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/applications   (SRS-012) — search, filter, pagination
+router.get("/", requireAuth, async (req, res) => {
+  try {
+    const { search, category, status, installed, page = 1, limit = 50, organization_id } = req.query;
+    const orgId = req.user.is_super_admin ? organization_id : req.user.organization_id;
+    if (!orgId) return res.status(400).json({ error: "organization_id is required" });
+
+    const conditions = ["a.organization_id = $1"];
+    const params = [orgId];
+
+    if (search) {
+      params.push(`%${search}%`);
+      conditions.push(`(a.name ILIKE $${params.length} OR a.package_name ILIKE $${params.length})`);
+    }
+    if (category) {
+      params.push(category);
+      conditions.push(`a.category = $${params.length}`);
+    }
+    if (status) {
+      params.push(status);
+      conditions.push(`a.status = $${params.length}`);
+    }
+
+    const filterParamCount = params.length;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    params.push(parseInt(limit), offset);
+
+    const result = await pool.query(
+      `SELECT a.*,
+              (SELECT COUNT(DISTINCT device_id) FROM application_assignments aa WHERE aa.application_id = a.id) AS assigned_devices_count,
+              (SELECT COUNT(DISTINCT da.device_id) FROM device_apps da JOIN devices dv ON da.device_id = dv.id
+                WHERE da.package_name = a.package_name AND dv.organization_id = a.organization_id) AS installed_count
+       FROM applications a
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY a.created_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+
+    const countResult = await pool.query(`SELECT COUNT(*) FROM applications a WHERE ${conditions.join(" AND ")}`, params.slice(0, filterParamCount));
+
+    res.json({ applications: result.rows, total: parseInt(countResult.rows[0].count), page: parseInt(page), limit: parseInt(limit) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/applications/stats   (SRS-012) — the 6 dashboard cards
+router.get("/stats", requireAuth, async (req, res) => {
+  try {
+    const orgId = req.user.is_super_admin ? req.query.organization_id : req.user.organization_id;
+    if (!orgId) return res.status(400).json({ error: "organization_id is required" });
+
+    const total = await pool.query("SELECT COUNT(*) FROM applications WHERE organization_id = $1", [orgId]);
+    const enterprise = await pool.query("SELECT COUNT(*) FROM applications WHERE organization_id = $1 AND category = 'Enterprise'", [orgId]);
+    const publicApps = await pool.query("SELECT COUNT(*) FROM applications WHERE organization_id = $1 AND category = 'Public'", [orgId]);
+    const blocked = await pool.query("SELECT COUNT(*) FROM applications WHERE organization_id = $1 AND status = 'blocked'", [orgId]);
+    const installed = await pool.query(
+      `SELECT COUNT(DISTINCT da.package_name) FROM device_apps da JOIN devices dv ON da.device_id = dv.id
+       JOIN applications a ON a.package_name = da.package_name AND a.organization_id = dv.organization_id
+       WHERE dv.organization_id = $1`,
+      [orgId]
+    );
+    const pending = await pool.query(
+      `SELECT COUNT(*) FROM commands c JOIN devices d ON c.device_id = d.id
+       WHERE d.organization_id = $1 AND c.command_type IN ('block_app', 'unblock_app') AND c.status = 'sent'`,
+      [orgId]
+    );
+
+    res.json({
+      total_applications: parseInt(total.rows[0].count),
+      enterprise_apps: parseInt(enterprise.rows[0].count),
+      public_apps: parseInt(publicApps.rows[0].count),
+      blocked_apps: parseInt(blocked.rows[0].count),
+      installed_applications: parseInt(installed.rows[0].count),
+      pending_installations: parseInt(pending.rows[0].count),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PUT /api/applications/:id
+router.put("/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, version, category, install_type } = req.body;
+    const result = await pool.query(
+      `UPDATE applications SET name = COALESCE($1, name), version = COALESCE($2, version),
+        category = COALESCE($3, category), install_type = COALESCE($4, install_type), updated_at = NOW()
+       WHERE id = $5 RETURNING *`,
+      [name, version, category, install_type, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Application not found" });
+    await logAudit({ userId: req.user.id, organizationId: result.rows[0].organization_id, action: "application_updated", status: "success", req });
+    res.json({ message: "Application updated", application: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Shared helper — sends block_app/unblock_app to a device via FCM
+async function sendAppCommand(device, commandType, packageName, issuedBy, req) {
+  const commandLog = await pool.query(
+    `INSERT INTO commands (device_id, command_type, issued_by, status) VALUES ($1, $2, $3, 'pending') RETURNING *`,
+    [device.id, commandType, issuedBy]
+  );
+  try {
+    await admin.messaging().send({ token: device.fcm_token, data: { command: commandType, command_id: String(commandLog.rows[0].id), package_name: packageName } });
+    await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1", [commandLog.rows[0].id]);
+  } catch (err) {
+    await pool.query("UPDATE commands SET status = 'failed', error_message = $1 WHERE id = $2", [err.message, commandLog.rows[0].id]);
+  }
+}
+
+// POST /api/applications/:id/assign   (SRS-012 FR-03)
+// Records the assignment, and — for Restricted-category apps — actively
+// blocks it on the target device(s), since that's the one action we can
+// genuinely enforce without a Managed Google Play integration.
+router.post("/:id/assign", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { device_uid, department_id } = req.body;
+    if (!device_uid && !department_id) return res.status(400).json({ error: "Select at least one device or department" });
+
+    const appResult = await pool.query("SELECT * FROM applications WHERE id = $1", [id]);
+    const app = appResult.rows[0];
+    if (!app) return res.status(404).json({ error: "Application not found" });
+
+    let targetDevices = [];
+    if (device_uid) {
+      const d = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, app.organization_id]);
+      targetDevices = d.rows;
+    } else {
+      const d = await pool.query(
+        `SELECT dv.* FROM devices dv JOIN employees e ON e.device_id = dv.id WHERE e.department_id = $1`,
+        [department_id]
+      );
+      targetDevices = d.rows;
+    }
+    if (targetDevices.length === 0) return res.status(404).json({ error: "No matching devices found" });
+
+    for (const device of targetDevices) {
+      await pool.query("INSERT INTO application_assignments (application_id, device_id, assigned_by) VALUES ($1, $2, $3)", [app.id, device.id, req.user.id]);
+      if (app.category === "Restricted" && device.fcm_token) {
+        await sendAppCommand(device, "block_app", app.package_name, req.user.id, req);
+      }
+    }
+
+    await logAudit({ userId: req.user.id, organizationId: app.organization_id, action: "application_assigned", status: "success", req, details: `${app.name} -> ${targetDevices.length} device(s)` });
+    res.json({ message: `Assigned to ${targetDevices.length} device(s)`, enforced: app.category === "Restricted" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PATCH /api/applications/:id/block   (SRS-012 FR-04) — blocks on every currently-assigned device
+router.patch("/:id/block", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const appResult = await pool.query("UPDATE applications SET status = 'blocked', updated_at = NOW() WHERE id = $1 RETURNING *", [id]);
+    const app = appResult.rows[0];
+    if (!app) return res.status(404).json({ error: "Application not found" });
+
+    const devices = await pool.query(
+      `SELECT DISTINCT dv.* FROM devices dv JOIN application_assignments aa ON aa.device_id = dv.id WHERE aa.application_id = $1 AND dv.fcm_token IS NOT NULL`,
+      [id]
+    );
+    for (const device of devices.rows) {
+      await sendAppCommand(device, "block_app", app.package_name, req.user.id, req);
+    }
+
+    await logAudit({ userId: req.user.id, organizationId: app.organization_id, action: "application_blocked", status: "success", req, details: app.package_name });
+    res.json({ message: "Application blocked", devices_notified: devices.rows.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PATCH /api/applications/:id/allow   (SRS-012 FR-05)
+router.patch("/:id/allow", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const appResult = await pool.query("UPDATE applications SET status = 'active', updated_at = NOW() WHERE id = $1 RETURNING *", [id]);
+    const app = appResult.rows[0];
+    if (!app) return res.status(404).json({ error: "Application not found" });
+
+    const devices = await pool.query(
+      `SELECT DISTINCT dv.* FROM devices dv JOIN application_assignments aa ON aa.device_id = dv.id WHERE aa.application_id = $1 AND dv.fcm_token IS NOT NULL`,
+      [id]
+    );
+    for (const device of devices.rows) {
+      await sendAppCommand(device, "unblock_app", app.package_name, req.user.id, req);
+    }
+
+    await logAudit({ userId: req.user.id, organizationId: app.organization_id, action: "application_allowed", status: "success", req, details: app.package_name });
+    res.json({ message: "Application allowed", devices_notified: devices.rows.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// DELETE /api/applications/:id
+router.delete("/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = await pool.query("SELECT * FROM applications WHERE id = $1", [id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Application not found" });
+
+    await pool.query("DELETE FROM application_assignments WHERE application_id = $1", [id]);
+    await pool.query("DELETE FROM applications WHERE id = $1", [id]);
+
+    await logAudit({ userId: req.user.id, organizationId: existing.rows[0].organization_id, action: "application_deleted", status: "success", req });
+    res.json({ message: "Application deleted" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ===================== DIRECT APK INSTALL =====================
+// Upload an APK once, then push a silent install to any device — the
+// piece that was previously deferred (that gap was Managed Google Play
+// / package-name installs from the Play Store, which need a Google
+// Cloud enterprise account; this instead ships the APK bytes directly
+// and installs via the Device Owner's PackageInstaller API, which
+// needs nothing beyond what's already set up).
+
+// POST /api/applications/packages   (multipart: apk file + app_name, package_name, version_name)
+router.post("/packages", requireAuth, upload.single("apk"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "APK file is required" });
+    const { app_name, package_name, version_name } = req.body;
+    if (!app_name || !app_name.trim()) return res.status(400).json({ error: "App name is required" });
+    if (!package_name || !isValidPackage(package_name)) return res.status(400).json({ error: "Package name is invalid" });
+
+    const orgId = req.user.organization_id;
+    const result = await pool.query(
+      `INSERT INTO app_packages (organization_id, app_name, package_name, version_name, file_size_bytes, apk_data)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, app_name, package_name, version_name, file_size_bytes, uploaded_at`,
+      [orgId, app_name.trim(), package_name.trim(), version_name || null, req.file.size, req.file.buffer]
+    );
+
+    await logAudit({ userId: req.user.id, organizationId: orgId, action: "app_package_uploaded", status: "success", req, details: `${app_name} (${package_name})` });
+    res.status(201).json({ message: "APK uploaded", package: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "APK is too large (max 150MB)" });
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/applications/packages   — metadata only, never the blob
+router.get("/packages", requireAuth, async (req, res) => {
+  try {
+    const orgId = req.user.is_super_admin ? (req.query.organization_id || req.user.organization_id) : req.user.organization_id;
+    const result = await pool.query(
+      `SELECT id, app_name, package_name, version_name, file_size_bytes, uploaded_at
+       FROM app_packages WHERE organization_id = $1 ORDER BY uploaded_at DESC`,
+      [orgId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// DELETE /api/applications/packages/:id
+router.delete("/packages/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = await pool.query("SELECT organization_id, app_name FROM app_packages WHERE id = $1", [id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Package not found" });
+    if (!req.user.is_super_admin && existing.rows[0].organization_id !== req.user.organization_id) {
+      return res.status(404).json({ error: "Package not found" });
+    }
+    await pool.query("DELETE FROM app_packages WHERE id = $1", [id]);
+    await logAudit({ userId: req.user.id, organizationId: existing.rows[0].organization_id, action: "app_package_deleted", status: "success", req, details: existing.rows[0].app_name });
+    res.json({ message: "Package deleted" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /api/applications/packages/:id/install   (body: { device_uid })
+// Sends a "install_app" FCM command carrying a download URL — the
+// device fetches the APK from GET /api/agent/apps/packages/:id/download
+// (agent-facing, in routes/agent.js) and installs it silently via
+// PackageInstaller, which Device Owner apps can do without a user
+// confirmation dialog.
+router.post("/packages/:id/install", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { device_uid } = req.body;
+    if (!device_uid) return res.status(400).json({ error: "device_uid is required" });
+
+    const pkgResult = await pool.query("SELECT * FROM app_packages WHERE id = $1", [id]);
+    const pkg = pkgResult.rows[0];
+    if (!pkg) return res.status(404).json({ error: "Package not found" });
+    if (!req.user.is_super_admin && pkg.organization_id !== req.user.organization_id) {
+      return res.status(404).json({ error: "Package not found" });
+    }
+
+    const deviceResult = await pool.query("SELECT * FROM devices WHERE device_uid = $1 AND organization_id = $2", [device_uid, pkg.organization_id]);
+    const device = deviceResult.rows[0];
+    if (!device) return res.status(404).json({ error: "Device not found" });
+    if (!device.fcm_token) return res.status(409).json({ error: "Device is not enrolled yet" });
+
+    const existingInstall = await pool.query(
+      "SELECT id FROM app_installs WHERE app_package_id = $1 AND device_id = $2",
+      [pkg.id, device.id]
+    );
+    if (existingInstall.rows.length > 0) {
+      return res.status(409).json({ error: `"${pkg.app_name}" is already installed on this device` });
+    }
+
+    const commandLog = await pool.query(
+      `INSERT INTO commands (device_id, command_type, issued_by, status, package_id) VALUES ($1, 'install_app', $2, 'pending', $3) RETURNING id`,
+      [device.id, req.user.id, pkg.id]
+    );
+
+    try {
+      await admin.messaging().send({
+        token: device.fcm_token,
+        data: {
+          command: "install_app",
+          command_id: String(commandLog.rows[0].id),
+          package_id: String(pkg.id),
+          package_name: pkg.package_name,
+          app_name: pkg.app_name,
+        },
+      });
+      await pool.query("UPDATE commands SET status = 'sent' WHERE id = $1", [commandLog.rows[0].id]);
+      await logAudit({ userId: req.user.id, organizationId: pkg.organization_id, action: "app_install_pushed", status: "success", req, details: `${pkg.app_name} -> ${device_uid}` });
+      res.json({ message: "Install command sent", command_id: commandLog.rows[0].id });
+    } catch (err) {
+      await pool.query("UPDATE commands SET status = 'failed', error_message = $1 WHERE id = $2", [err.message, commandLog.rows[0].id]);
+      res.status(502).json({ error: "Failed to reach device" });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/applications/packages/installs   — full install history:
+// which APK, which device, which admin pushed it, and when.
+router.get("/packages/installs", requireAuth, async (req, res) => {
+  try {
+    const orgId = req.user.is_super_admin ? (req.query.organization_id || req.user.organization_id) : req.user.organization_id;
+    const result = await pool.query(
+      `SELECT ai.id, ai.installed_at,
+              ap.app_name, ap.package_name, ap.version_name,
+              dv.device_uid, dv.model AS device_model,
+              u.name AS installed_by_name
+       FROM app_installs ai
+       JOIN app_packages ap ON ai.app_package_id = ap.id
+       JOIN devices dv ON ai.device_id = dv.id
+       LEFT JOIN users u ON ai.installed_by = u.id
+       WHERE ai.organization_id = $1
+       ORDER BY ai.installed_at DESC
+       LIMIT 200`,
+      [orgId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+module.exports = router;
